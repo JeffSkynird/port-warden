@@ -1,0 +1,27 @@
+{
+  "default_profile": "python_server",
+  "profiles": {
+    "docker_compose": {
+      "ports": [3000, 5000, 6379, 9000, 15672],
+      "cwd": ".",
+      "start": "docker compose up -d",
+      "stop": "docker compose down"
+    },
+    "python_server": {
+      "ports": [3000],
+      "cwd": ".",
+      "start": "python3 -m http.server 3000"
+    },
+    "node_server": {
+      "ports": [3000],
+      "cwd": "./backend",
+      "start": "npm run dev"
+    },
+    "db": { "ports": [5432, 3306] },
+    "docker_single": { 
+      "ports": [5432],
+      "start":"docker run --name some-postgres -p 5432:5432 -e POSTGRES_PASSWORD=mysecretpassword -d postgres",
+      "stop":"docker rm -f some-postgres"
+    }
+  }
+}
