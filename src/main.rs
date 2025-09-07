@@ -1,15 +1,13 @@
-use anyhow::{Context, Result};
+use anyhow::Result;
 use once_cell::sync::Lazy;
 use parking_lot::RwLock;
-use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, HashSet},
-    fs,
-    path::PathBuf,
-    str::FromStr,
     thread,
     time::{Duration, Instant},
 };
+#[cfg(feature = "gui")]
+use std::path::PathBuf;
 #[cfg(feature = "gui")]
 use std::net::SocketAddr;
 #[cfg(feature = "gui")]
@@ -26,96 +24,13 @@ use tray_icon::{TrayIcon, TrayIconBuilder};
 #[cfg(feature = "gui")]
 use tray_icon::menu::{Menu, MenuItemBuilder, PredefinedMenuItem, Submenu};
 
+use port_warden::{active_profile, Config, DockerInfo, ProcInfo, SystemOps, run_cli_with};
+#[cfg(feature = "gui")]
+use port_warden::{load_profiles_from_fs, ProfileCfg};
+
 // Max label length to avoid the tray menu stretching horizontally
 #[cfg(feature = "gui")]
 const MENU_CMD_LABEL_MAX: usize = 60;
-
-// Default ports used when `PORTKILL_PORTS` is not set and
-// when no profile is found. Adjust here for quick changes.
-static DEFAULT_PORTS: &[u16] = &[3000, 8000];
-
-// ===== Profiles (.portkill.json) =====
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-struct ProfileCfg {
-    ports: Vec<u16>,
-    #[serde(default)]
-    cwd: Option<PathBuf>,
-    #[serde(default)]
-    start: Option<String>,
-    #[serde(default)]
-    stop: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-struct FileCfg {
-    #[serde(default)]
-    default_profile: Option<String>,
-    #[serde(default)]
-    profiles: HashMap<String, ProfileCfg>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct Config {
-    refresh_secs: u64,
-    active_profile: String,
-    project_root: PathBuf,
-    file_cfg: FileCfg,
-    cpu_threshold: f32,   // %
-    mem_threshold_mb: u64,
-    alerts_enabled: bool,
-}
-
-impl Default for Config {
-    fn default() -> Self {
-        let refresh_secs = std::env::var("PORTKILL_REFRESH").ok().and_then(|v| v.parse().ok()).unwrap_or(2);
-        let (root, file_cfg) = load_profiles_from_fs().unwrap_or_else(|| (std::env::current_dir().unwrap(), FileCfg::default()));
-        let active_profile = file_cfg.default_profile.clone().unwrap_or_else(|| "default".to_string());
-        let cpu_threshold = std::env::var("PORTKILL_CPU").ok().and_then(|v| v.parse().ok()).unwrap_or(90.0);
-        let mem_threshold_mb = std::env::var("PORTKILL_MEM_MB").ok().and_then(|v| v.parse().ok()).unwrap_or(1024);
-        Self { refresh_secs, active_profile, project_root: root, file_cfg, cpu_threshold, mem_threshold_mb, alerts_enabled: false }
-    }
-}
-
-fn load_profiles_from_fs() -> Option<(PathBuf, FileCfg)> {
-    let mut dir = std::env::current_dir().ok()?;
-    loop {
-        let candidate = dir.join(".portkill.json");
-        if candidate.exists() {
-            let txt = fs::read_to_string(&candidate).ok()?;
-            let cfg: FileCfg = serde_json::from_str(&txt).ok()?;
-            return Some((dir, cfg));
-        }
-        if !dir.pop() { break; }
-    }
-    None
-}
-
-fn active_profile(cfg: &Config) -> ProfileCfg {
-    cfg.file_cfg
-        .profiles
-        .get(&cfg.active_profile)
-        .cloned()
-        .unwrap_or_else(|| ProfileCfg { ports: env_ports_default(), cwd: Some(cfg.project_root.clone()), start: None, stop: None })
-}
-
-fn env_ports_default() -> Vec<u16> {
-    std::env::var("PORTKILL_PORTS").ok().and_then(|s| {
-        let mut out = Vec::new();
-        for p in s.split(',') { if let Ok(v) = p.trim().parse::<u16>() { out.push(v); } }
-        if out.is_empty() { None } else { Some(out) }
-    }).unwrap_or_else(|| DEFAULT_PORTS.to_vec())
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-struct DockerInfo { id: String, name: String, image: String }
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-struct ProcInfo {
-    pid: u32,               // 0 if not applies (p. ej. container)
-    name: String,
-    #[serde(default)]
-    docker: Option<DockerInfo>,
-}
 
 static STATE: Lazy<RwLock<State>> = Lazy::new(|| RwLock::new(State::default()));
 #[cfg(feature = "gui")]
@@ -492,27 +407,20 @@ fn build_menu() -> Menu {
 }
 
 // ===== simple CLI =====
-fn run_cli() -> Result<()> {
-    let cfg = Config::default();
-    let profile = active_profile(&cfg);
-    let args: Vec<String> = std::env::args().collect();
-    let cmd = args.get(1).map(|s| s.as_str()).unwrap_or("list");
-    let map = scan_ports(&profile.ports)?;
-
-    match cmd {
-        "list" => { println!("Perfil: {} @ {:?}", cfg.active_profile, cfg.project_root); println!("Puertos: {:?}", profile.ports); for port in &profile.ports { let v = map.get(port).cloned().unwrap_or_default(); if v.is_empty() { println!("{}: libre", port); } else { for p in v { if let Some(d)=p.docker { println!("{}: container {} ({})", port, d.name, d.image); } else { println!("{}: {} (pid {})", port, p.name, p.pid); } } } } }
-        "kill-all" => { let mut total = 0; for port in &profile.ports { if let Some(list)=map.get(port){ for p in list { if p.pid!=0 && kill_pid_smart(p.pid).is_ok() { total+=1; } } } } println!("Matados {total} procesos."); }
-        other if other.starts_with("kill:") => { let port = u16::from_str(other.trim_start_matches("kill:")).context("Formato: kill:<puerto>")?; if let Some(list)=map.get(&port){ let mut n=0; for p in list { if p.pid!=0 && kill_pid_smart(p.pid).is_ok(){n+=1;} } println!("Puerto {port}: {n} procesos terminados"); } else { println!("Puerto {port}: libre"); } }
-        _ => eprintln!("Uso: port-kill [list|kill:<puerto>|kill-all]"),
-    }
-    Ok(())
+struct RealSystemOps;
+impl SystemOps for RealSystemOps {
+    fn scan(&self, targets: &[u16]) -> Result<HashMap<u16, Vec<ProcInfo>>> { scan_ports(targets) }
+    fn kill_pid(&self, pid: u32) -> bool { kill_pid_smart(pid).is_ok() }
 }
 
 // ===== Main + monitoring =====
 #[cfg(feature = "gui")]
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
-    if std::env::var("PORTKILL_MODE").as_deref() == Ok("cli") || args.iter().any(|a| a == "--cli") { return run_cli(); }
+    if std::env::var("PORTKILL_MODE").as_deref() == Ok("cli") || args.iter().any(|a| a == "--cli") {
+        let mut out = std::io::stdout();
+        return run_cli_with(args, &mut out, &RealSystemOps);
+    }
     // Opt-in HTTP API flag (disabled by default)
     let enable_api = args.iter().any(|a| a == "--api");
 
@@ -700,5 +608,7 @@ fn main() -> Result<()> {
         st.ports = scan_ports(&profile.ports).unwrap_or_default();
         st.last_busy = profile.ports.iter().map(|p| (*p, st.ports.get(p).map(|v| !v.is_empty()).unwrap_or(false))).collect();
     }
-    run_cli()
+    let args: Vec<String> = std::env::args().collect();
+    let mut out = std::io::stdout();
+    run_cli_with(args, &mut out, &RealSystemOps)
 }
