@@ -2,7 +2,10 @@
 
 A tiny cross‑platform tray app to **see, free, and relaunch ports** used by your dev stack. Built with **Rust**, **netstat2**, **sysinfo**, and optional **Docker** awareness.
 
----
+## Preview
+
+![Preview 1](images/menu.png) ![Preview 2](images/port.png)
+
 
 ## ✨ Features
 
